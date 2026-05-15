@@ -153,57 +153,54 @@ def click_next(page):
     return try_click(page, SEL_NEXT, 2500)
 
 def find_parte_tabs(page):
-    tabs = []
-    labels = ['Parte 1', 'Parte 2', 'Parte 3', 'Parte 4']
-    for label in labels:
+    labels = []
+    seen = set()
+    try:
+        candidates = page.locator(r'text=/Parte\s+\d+/i >> visible=true').all()
+    except Exception:
+        candidates = []
+    for loc in candidates:
         try:
-            locs = page.locator(f'text="{label}" >> visible=true').all()
-            for loc in locs:
-                txt = loc.text_content()
-                if txt and txt.strip() == label:
-                    tabs.append((loc, label))
-                    break
+            txt = (loc.text_content() or '').strip()
+            if not re.match(r'^Parte\s+\d+$', txt, re.I):
+                continue
+            txt = re.sub(r'\s+', ' ', txt)
+            if txt in seen:
+                continue
+            seen.add(txt)
+            labels.append(txt)
         except Exception:
             pass
-    return tabs
+    labels.sort(key=lambda s: int(re.search(r'(\d+)', s).group(1)) if re.search(r'(\d+)', s) else 9999)
+    return labels
 
 def find_section_tiles(page):
+    labels = []
+    seen = set()
     try:
-        locs = page.locator("text=/Seção/i >> visible=true").all()
-        out = []
-        for loc in locs:
-            try:
-                txt = (loc.text_content() or '').strip()
-                if 'Seção' in txt or 'Secao' in txt:
-                    out.append(loc)
-            except Exception:
-                pass
-        if out:
-            return out, 'text=/Seção/i'
+        locs = page.locator(r"text=/Seç[aã]o\s*\d+/i >> visible=true").all()
     except Exception:
-        pass
-    for label in [f'Seção {i:02d}' for i in range(1, 30)] + [f'Secao {i:02d}' for i in range(1, 30)]:
+        locs = []
+    for loc in locs:
         try:
-            locs = page.locator(f'text="{label}" >> visible=true').all()
-            if locs:
-                out = []
-                for label2 in [f'Seção {j:02d}' for j in range(1, 30)] + [f'Secao {j:02d}' for j in range(1, 30)]:
-                    try:
-                        locs2 = page.locator(f'text="{label2}" >> visible=true').all()
-                        if locs2:
-                            out.append(locs2[0])
-                    except Exception:
-                        pass
-                if out:
-                    return out, 'exact text labels'
+            txt = (loc.text_content() or '').strip()
+            m = re.search(r'Seç[aã]o\s*\d+', txt, re.I)
+            if not m:
+                continue
+            label = re.sub(r'\s+', ' ', m.group(0)).strip()
+            if label in seen:
+                continue
+            seen.add(label)
+            labels.append(label)
         except Exception:
             pass
-    return [], None
+    labels.sort(key=lambda s: int(re.search(r'(\d+)', s).group(1)) if re.search(r'(\d+)', s) else 9999)
+    return labels, ('text=/Seção/i' if labels else None)
 
 def tile_label(tile, idx):
     try:
-        txt = (tile.text_content() or '').strip()
-        m = re.search(r'Seção\s*\d+', txt, re.I)
+        txt = str(tile).strip()
+        m = re.search(r'Seç[aã]o\s*\d+', txt, re.I)
         if m:
             txt = m.group(0)
         txt = re.sub(r'\s+', '_', txt)
@@ -293,96 +290,86 @@ def scrape_current_section(page, key, slug, global_idx, model_dir, http_session,
     for _ in range(3):
         if try_click(page, SEL_ZOOM, 2000):
             zoom = True
-            time.sleep(2.5) 
+            time.sleep(2.5)
             break
         time.sleep(1.0)
-        
-    # Fallback to double click if the button is hidden
+
     if not zoom:
         try:
             active_img = page.locator(".carousel__slide--active img >> visible=true").last
             active_img.dblclick(timeout=1000, force=True)
             zoom = True
             time.sleep(2.0)
-        except: pass
-            
+        except Exception:
+            pass
+
     _, total = read_counter(page)
-    loop_count = total if 0 < total <= 30 else 15
+    loop_count = total if total > 0 else 30
     tqdm.write(f'  -> {key}: {total if total > 0 else "Unknown"} photo(s) [zoom={zoom}]')
-    
-    local_seen_urls = set()
-    local_seen_hashes = set()
-    consecutive_local_dupes = 0
+
+    last_sig = None
+    stuck_repeats = 0
     consecutive_misses = 0
-    
+
     for i in range(1, loop_count + 1):
         res = grab_image(page)
         stem = f'{slug} - {global_idx:03d}'
-        
-        if res:
-            consecutive_misses = 0
-            ext, payload = res
-            
-            # --- HTTP URL HANDLING ---
-            if ext == 'src_url':
-                url = payload.decode()
-                clean_url = url.split('?')[0] 
-                
-                # 1. LOCAL DEDUPE (Detect if slider is stuck/finished)
-                if clean_url in local_seen_urls:
-                    consecutive_local_dupes += 1
-                    if consecutive_local_dupes >= 2:
-                        tqdm.write('    [!] End of section detected (Local Duplicate). Breaking early.')
-                        break
-                else:
-                    consecutive_local_dupes = 0
-                    local_seen_urls.add(clean_url)
-                    
-                    # 2. GLOBAL DEDUPE (Detect overlap from previous sections)
-                    if clean_url in global_seen_urls:
-                        tqdm.write(f'    SKIP {stem} (Global Duplicate URL)')
-                    else:
-                        global_seen_urls.add(clean_url)
-                        out = model_dir / f"{stem}.{clean_url.rsplit('.',1)[-1] or 'jpg'}"
-                        download_url(url, http_session, out)
-                        tqdm.write(f'    OK {out.name}')
-                        global_idx += 1
-            
-            # --- BASE64 HANDLING ---
-            else:
-                payload_hash = hashlib.md5(payload).hexdigest()
-                
-                # 1. LOCAL DEDUPE (Detect if slider is stuck/finished)
-                if payload_hash in local_seen_hashes:
-                    consecutive_local_dupes += 1
-                    if consecutive_local_dupes >= 2:
-                        tqdm.write('    [!] End of section detected (Local Duplicate). Breaking early.')
-                        break
-                else:
-                    consecutive_local_dupes = 0
-                    local_seen_hashes.add(payload_hash)
-                    
-                    # 2. GLOBAL DEDUPE (Detect overlap from previous sections)
-                    if payload_hash in global_seen_hashes:
-                        tqdm.write(f'    SKIP {stem} (Global Duplicate Base64)')
-                    else:
-                        global_seen_hashes.add(payload_hash)
-                        out = model_dir / f'{stem}.{ext}'
-                        save_bytes(payload, out)
-                        tqdm.write(f'    OK {out.name}')
-                        global_idx += 1
-                    
-        else:
+
+        if not res:
             consecutive_misses += 1
-            tqdm.write(f'    MISS (Timeout waiting for High-Res)')
+            tqdm.write('    MISS (Timeout waiting for High-Res)')
             if consecutive_misses >= 3:
                 tqdm.write('    [!] Multiple misses detected. Breaking early.')
                 break
-                
+            if i < loop_count:
+                click_next(page)
+                time.sleep(max(1.5, delay))
+            continue
+
+        consecutive_misses = 0
+        ext, payload = res
+
+        if ext == 'src_url':
+            url = payload.decode()
+            clean_url = url.split('?')[0]
+            sig = ('url', clean_url)
+        else:
+            payload_hash = hashlib.md5(payload).hexdigest()
+            sig = ('b64', payload_hash)
+
+        if sig == last_sig:
+            stuck_repeats += 1
+        else:
+            last_sig = sig
+            stuck_repeats = 0
+
+        if stuck_repeats >= 3:
+            tqdm.write('    [!] Same frame repeated after navigation. Breaking early.')
+            break
+
+        if ext == 'src_url':
+            if clean_url in global_seen_urls:
+                tqdm.write(f'    SKIP {stem} (Global Duplicate URL)')
+            else:
+                global_seen_urls.add(clean_url)
+                out = model_dir / f"{stem}.{clean_url.rsplit('.',1)[-1] or 'jpg'}"
+                download_url(url, http_session, out)
+                tqdm.write(f'    OK {out.name}')
+                global_idx += 1
+        else:
+            if payload_hash in global_seen_hashes:
+                tqdm.write(f'    SKIP {stem} (Global Duplicate Base64)')
+            else:
+                global_seen_hashes.add(payload_hash)
+                out = model_dir / f'{stem}.{ext}'
+                save_bytes(payload, out)
+                tqdm.write(f'    OK {out.name}')
+                global_idx += 1
+
         if i < loop_count:
             click_next(page)
             time.sleep(max(1.5, delay))
-            
+
     force_close_modal(page)
     time.sleep(0.5)
     return global_idx
@@ -429,31 +416,31 @@ def scrape_model(url, profile_dir, output_dir, headless, delay, debug):
             print(f'[*] Parte tabs found: {len(tabs)}')
         else:
             print('[*] No Parte tabs found; will process current view as Parte_1')
-            tabs = [(None, 'Parte 1')]
+            tabs = ['Parte 1']
 
         global_idx = 1
         done = set()
         global_seen_urls = set()
         global_seen_hashes = set()
-        
-        for loc, label in tabs:
+
+        for label in tabs:
             safe_part = re.sub(r'\s+', '_', label.strip())
             tqdm.write(f'\n[*] Processing: {safe_part}')
-            if loc is not None:
+            if label != 'Parte 1' or len(tabs) > 1:
                 try:
                     force_close_modal(page)
-                    loc.click(timeout=5000, force=True)
-                    time.sleep(2.5)
+                    page.locator(f'text="{label}" >> visible=true').last.click(timeout=7000, force=True)
+                    time.sleep(3.0)
                 except Exception as e:
                     tqdm.write(f'[warn] could not click {label}: {e}')
                     continue
-                    
+
             tiles, used = find_section_tiles(page)
-            print(f"  Sections found ({used}): {len(tiles)}")
+            print(f" Sections found ({used}): {len(tiles)}")
             if not tiles:
-                tqdm.write(f'  [warn] no tiles in {safe_part} — skipping')
+                tqdm.write(f' [warn] no tiles in {safe_part} — skipping')
                 continue
-                
+
             for idx, tile in enumerate(tiles, 1):
                 label2 = tile_label(tile, idx)
                 key = f'{safe_part}_{label2}'
@@ -462,18 +449,20 @@ def scrape_model(url, profile_dir, output_dir, headless, delay, debug):
                 done.add(key)
                 try:
                     force_close_modal(page)
-                    tile.scroll_into_view_if_needed()
-                    tile.click(timeout=5000, force=True)
-                    time.sleep(2.0)
-                    tqdm.write(f"\n  [{'LOCKED' if tile_is_locked(tile) else 'OPEN  '}] {key}")
-                    
+                    tile_loc = page.locator(f'text="{tile}" >> visible=true').last
+                    tile_loc.scroll_into_view_if_needed(timeout=7000)
+                    tile_loc.click(timeout=7000, force=True)
+                    time.sleep(2.5)
+                    tqdm.write(f"\n [{'LOCKED' if tile_is_locked(tile_loc) else 'OPEN '}] {key}")
+
                     global_idx = scrape_current_section(
                         page, key, slug, global_idx, model_dir, http_session, delay,
                         global_seen_urls, global_seen_hashes
                     )
+
                 except Exception as e:
-                    tqdm.write(f'  [warn] {key}: {e}')
-                    
+                    tqdm.write(f' [warn] {key}: {e}')
+
         if debug:
             page.screenshot(path=str(model_dir / '_debug_03_done.png'), full_page=True)
             print('[debug] _debug_03_done.png')
