@@ -359,6 +359,42 @@ def read_counter(page):
     return 1, 0
 
 
+
+
+def estimate_gallery_total(page):
+    totals = []
+    try:
+        cur, total = read_counter(page)
+        if total and total > 0:
+            totals.append(total)
+    except Exception:
+        pass
+    selectors = [
+        '.carousel__pagination-item',
+        '.pswp__counter', '.x-of-y', '.number-image', '[class*="counter" i]'
+    ]
+    for sel in selectors:
+        try:
+            count = page.locator(f"{sel} >> visible=true").count()
+            if sel == '.carousel__pagination-item' and count > 1:
+                totals.append(count)
+        except Exception:
+            pass
+        try:
+            locs = page.locator(f"{sel} >> visible=true").all()
+        except Exception:
+            locs = []
+        for loc in locs:
+            try:
+                txt = (loc.text_content() or '').strip()
+            except Exception:
+                continue
+            for m in re.finditer(r'(\d+)\s*[\/de|-]\s*(\d+)', txt, re.I):
+                totals.append(int(m.group(2)))
+    totals = [n for n in totals if 1 < n <= 500]
+    return max(totals) if totals else 0
+
+
 def click_next(page):
     try:
         page.keyboard.press('ArrowRight')
@@ -499,13 +535,16 @@ def scrape_current_section(page, key, slug, global_idx, model_dir, http_session,
     zoom = ensure_zoom_mode(page)
 
     _, total = read_counter(page)
-    loop_count = total if total > 0 else 30
-    debug_log(f' -> {key}: {total if total > 0 else "Unknown"} photo(s) [zoom={zoom}]')
-    dump_page_state(page, f'{key}_opened', note=f'zoom={zoom} total={total} loop_count={loop_count}')
+    estimated_total = max(total, estimate_gallery_total(page))
+    loop_count = estimated_total if estimated_total > 0 else 30
+    debug_log(f' -> {key}: {estimated_total if estimated_total > 0 else "Unknown"} photo(s) [zoom={zoom}]')
+    dump_page_state(page, f'{key}_opened', note=f'zoom={zoom} total={estimated_total} loop_count={loop_count}')
 
     last_sig = None
     stuck_repeats = 0
     consecutive_misses = 0
+    section_new = 0
+    consecutive_section_duplicates = 0
 
     for i in range(1, loop_count + 1):
         before_sig = active_frame_signature(page)
@@ -558,15 +597,18 @@ def scrape_current_section(page, key, slug, global_idx, model_dir, http_session,
                     stuck_repeats = 0
                 debug_log(f' [sig] {key} idx={i} sig={sig} stuck_repeats={stuck_repeats}')
                 if clean_url in global_seen_urls:
+                    consecutive_section_duplicates += 1
                     try:
                         out.unlink(missing_ok=True)
                     except Exception:
                         pass
                     debug_log(f' SKIP {stem} (Global Duplicate URL)')
                 else:
+                    consecutive_section_duplicates = 0
                     global_seen_urls.add(clean_url)
                     debug_log(f' OK {out.name} [{w}x{h}]')
                     global_idx += 1
+                    section_new += 1
                 break
             else:
                 payload_hash = hashlib.md5(payload).hexdigest()
@@ -594,16 +636,29 @@ def scrape_current_section(page, key, slug, global_idx, model_dir, http_session,
                     stuck_repeats = 0
                 debug_log(f' [sig] {key} idx={i} sig={sig} stuck_repeats={stuck_repeats}')
                 if payload_hash in global_seen_hashes:
+                    consecutive_section_duplicates += 1
                     try:
                         out.unlink(missing_ok=True)
                     except Exception:
                         pass
                     debug_log(f' SKIP {stem} (Global Duplicate Base64)')
                 else:
+                    consecutive_section_duplicates = 0
                     global_seen_hashes.add(payload_hash)
                     debug_log(f' OK {out.name} [{w}x{h}]')
                     global_idx += 1
+                    section_new += 1
                 break
+
+        if section_new == 0 and consecutive_section_duplicates >= 3:
+            debug_log(' [!] Section yielded only global duplicates. Breaking early.')
+            dump_page_state(page, f'{key}_dupe_break_{i:03d}', note='section only duplicates')
+            break
+
+        if estimated_total > 0 and section_new >= estimated_total:
+            debug_log(f' [!] Expected total reached ({estimated_total}). Breaking early.')
+            dump_page_state(page, f'{key}_count_break_{i:03d}', note=f'estimated_total={estimated_total}')
+            break
 
         if stuck_repeats >= 3:
             debug_log(' [!] Same frame repeated after navigation. Breaking early.')
@@ -619,7 +674,6 @@ def scrape_current_section(page, key, slug, global_idx, model_dir, http_session,
     force_close_modal(page)
     time.sleep(0.5)
     return global_idx
-
 
 def scrape_model(url, profile_dir, output_dir, headless, delay, debug):
     global DEBUG, DEBUG_DIR, DEBUG_LOG_FH
