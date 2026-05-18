@@ -5,6 +5,9 @@ import hashlib
 import re
 import sys
 import time
+import shutil
+import subprocess
+from tqdm import tqdm
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -130,6 +133,243 @@ def active_frame_signature(page):
             pass
     return None
 
+
+
+SEL_VIDEO_DOWNLOAD_BTN = "#btn-download-video button, #btn-download-video, button:has-text('Download')"
+
+
+def model_video_url(url: str) -> str:
+    parsed = urlparse(url)
+    path = parsed.path
+    if '/video' in path:
+        return url
+    if '/photo' in path:
+        path = path.replace('/photo', '/video')
+    elif '/fotos' in path:
+        path = path.replace('/fotos', '/video')
+    else:
+        path = path.rstrip('/') + '/video'
+    return f"{parsed.scheme}://{parsed.netloc}{path}"
+
+
+def unique_preserve(items):
+    out, seen = [], set()
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def list_video_parts(page):
+    labels = []
+    try:
+        locs = page.locator(r'text=/Parte\s+\d+/i >> visible=true').all()
+    except Exception:
+        locs = []
+    for loc in locs:
+        try:
+            txt = re.sub(r'\s+', ' ', (loc.text_content() or '').strip())
+        except Exception:
+            txt = ''
+        if re.match(r'^Parte\s+\d+$', txt, re.I):
+            labels.append(txt)
+    labels = unique_preserve(labels)
+    labels.sort(key=lambda s: int(re.search(r'(\d+)', s).group(1)) if re.search(r'(\d+)', s) else 9999)
+    return labels or ['Parte 1']
+
+
+def click_part_label(page, label):
+    selectors = [
+        f'text="{label}"',
+        f'.title-part:has-text("{label}")',
+        f'.text1:has-text("{label}")',
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).last
+            if loc.count() == 0:
+                continue
+            loc.scroll_into_view_if_needed(timeout=3000)
+            loc.click(timeout=5000, force=True)
+            time.sleep(5.0)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def extract_video_candidates_from_performance(page):
+    js = """
+() => {
+  const out = [];
+  const entries = performance.getEntriesByType('resource') || [];
+  for (const e of entries) {
+    const name = e && e.name ? String(e.name) : '';
+    if (!name) continue;
+    const low = name.toLowerCase();
+    if (low.includes('.mp4') || low.includes('.m3u8') || low.includes('urlset/master.m3u8') || low.includes('/hls/videos/')) {
+      out.push(name);
+    }
+  }
+  return out;
+}
+"""
+    try:
+        return page.evaluate(js) or []
+    except Exception:
+        return []
+
+
+def collect_media_candidates(page, network_log):
+    urls = []
+    try:
+        current = page.locator('video').evaluate("els => els.map(v => v.currentSrc || v.src || '').filter(Boolean)")
+        urls.extend(current)
+    except Exception:
+        pass
+    urls.extend(extract_video_candidates_from_performance(page))
+    for item in network_log:
+        u = item.get('url', '')
+        ctype = (item.get('content_type') or '').lower()
+        if any(ext in u.lower() for ext in ('.mp4', '.m3u8', '.webm', '.mov')) or any(k in ctype for k in ('video/', 'mpegurl', 'mp2t')):
+            urls.append(u)
+    fixed = []
+    for u in unique_preserve(urls):
+        if ',.urlset/master.m3u8' in u:
+            base_mp4 = u.replace(',.urlset/master.m3u8', '')
+            fixed.append(u)
+            fixed.append(base_mp4)
+            fixed.append(base_mp4 + ',.urlset/master.m3u8')
+        else:
+            fixed.append(u)
+    return unique_preserve(fixed)
+
+
+def choose_best_video_candidate(candidates, part_idx):
+    if not candidates:
+        return None
+    idx1 = part_idx + 1
+    def score(url):
+        u = url.lower()
+        s = 0
+        if f'4k{idx1}.mp4,.urlset/master.m3u8' in u:
+            s += 50000
+        if f'4k{idx1}' in u:
+            s += 30000
+        if f'4k-{idx1}' in u:
+            s += 28000
+        if f'/4k{idx1}.' in u:
+            s += 26000
+        if '.m3u8' in u:
+            s += 12000
+        if '.mp4' in u:
+            s += 5000
+        if '4k' in u or '2160' in u:
+            s += 2000
+        elif '1080' in u:
+            s += 1000
+        return s
+    return sorted(candidates, key=score, reverse=True)[0]
+
+
+def download_stream_or_file(url: str, session: requests.Session, dest_base: Path):
+    out = dest_base.with_suffix('.mp4')
+    out.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg = shutil.which('ffmpeg')
+    if ffmpeg:
+        input_url = url if '.m3u8' in url.lower() else (url + ',.urlset/master.m3u8' if url.lower().endswith('.mp4') and '.urlset/master.m3u8' not in url.lower() else url)
+        cmd = [ffmpeg, '-y', '-protocol_whitelist', 'file,http,https,tcp,tls,crypto', '-i', input_url, '-c', 'copy', str(out)]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode == 0 and out.exists() and out.stat().st_size > 0:
+            return out
+    r = session.get(url, stream=True, timeout=60)
+    r.raise_for_status()
+    total = int(r.headers.get('content-length', '0') or 0)
+    with open(out, 'wb') as f, tqdm(total=total if total > 0 else None, unit='B', unit_scale=True, unit_divisor=1024, desc=out.name, leave=True) as bar:
+        for chunk in r.iter_content(1024 * 1024):
+            if chunk:
+                f.write(chunk)
+                bar.update(len(chunk))
+    return out
+
+
+def click_download_and_capture(page, wait_s=8.0):
+    seen = []
+    def on_download(dl):
+        seen.append(dl)
+    page.on('download', on_download)
+    try:
+        try:
+            page.locator(SEL_VIDEO_DOWNLOAD_BTN).first.click(timeout=5000, force=True)
+        except Exception:
+            return None
+        end = time.time() + wait_s
+        while time.time() < end:
+            if seen:
+                return seen[-1]
+            time.sleep(0.25)
+    finally:
+        try:
+            page.remove_listener('download', on_download)
+        except Exception:
+            pass
+    return None
+
+
+def scrape_videos(page, model_dir: Path, slug: str, http_session: requests.Session, delay: float, debug: bool = False):
+    video_dir = model_dir / 'videos'
+    video_dir.mkdir(parents=True, exist_ok=True)
+    parts = list_video_parts(page)
+    debug_log(f'[*] Video Parte tabs found: {len(parts)} -> {parts}')
+    saved = 0
+
+    for idx, label in enumerate(parts):
+        safe_part = re.sub(r'\s+', '_', label.strip())
+        network_log = []
+        def on_response(resp):
+            try:
+                network_log.append({'url': resp.url, 'content_type': resp.headers.get('content-type','')})
+            except Exception:
+                pass
+        page.on('response', on_response)
+        try:
+            if idx == 0:
+                debug_log(f'[*] Processing landing video {safe_part}')
+            else:
+                click_part_label(page, label)
+            debug_log(f'[*] Processing video {safe_part} [resolution=default]')
+            time.sleep(max(5.0, delay))
+
+            candidates = collect_media_candidates(page, network_log)
+            best = choose_best_video_candidate(candidates, idx)
+            debug_log(f'[*] Video candidates for {safe_part}: {len(candidates)} -> {candidates[:8]}')
+            if not best:
+                dl = click_download_and_capture(page, wait_s=10.0)
+                if dl is not None:
+                    suggested = dl.suggested_filename or f'{slug} - {safe_part.lower()}.mp4'
+                    ext = Path(suggested).suffix or '.mp4'
+                    dest = video_dir / f'{slug} - {safe_part.lower()}{ext}'
+                    try:
+                        dl.save_as(str(dest))
+                        debug_log(f' OK {dest.name} [browser download]')
+                        saved += 1
+                        continue
+                    except Exception as e:
+                        debug_log(f' [warn] browser download save failed for {safe_part}: {e}')
+                debug_log(f' [warn] no downloadable video found in {safe_part}')
+                continue
+            out = download_stream_or_file(best, http_session, video_dir / f'{slug} - {safe_part.lower()}')
+            debug_log(f' OK {out.name}')
+            saved += 1
+        except Exception as e:
+            debug_log(f' [warn] {safe_part}: {e}')
+        finally:
+            try:
+                page.remove_listener('response', on_response)
+            except Exception:
+                pass
+    return saved
 
 def extract_slug(url: str) -> str:
     parts = urlparse(url).path.strip('/').split('/')
@@ -359,42 +599,6 @@ def read_counter(page):
     return 1, 0
 
 
-
-
-def estimate_gallery_total(page):
-    totals = []
-    try:
-        cur, total = read_counter(page)
-        if total and total > 0:
-            totals.append(total)
-    except Exception:
-        pass
-    selectors = [
-        '.carousel__pagination-item',
-        '.pswp__counter', '.x-of-y', '.number-image', '[class*="counter" i]'
-    ]
-    for sel in selectors:
-        try:
-            count = page.locator(f"{sel} >> visible=true").count()
-            if sel == '.carousel__pagination-item' and count > 1:
-                totals.append(count)
-        except Exception:
-            pass
-        try:
-            locs = page.locator(f"{sel} >> visible=true").all()
-        except Exception:
-            locs = []
-        for loc in locs:
-            try:
-                txt = (loc.text_content() or '').strip()
-            except Exception:
-                continue
-            for m in re.finditer(r'(\d+)\s*[\/de|-]\s*(\d+)', txt, re.I):
-                totals.append(int(m.group(2)))
-    totals = [n for n in totals if 1 < n <= 500]
-    return max(totals) if totals else 0
-
-
 def click_next(page):
     try:
         page.keyboard.press('ArrowRight')
@@ -535,16 +739,13 @@ def scrape_current_section(page, key, slug, global_idx, model_dir, http_session,
     zoom = ensure_zoom_mode(page)
 
     _, total = read_counter(page)
-    estimated_total = max(total, estimate_gallery_total(page))
-    loop_count = estimated_total if estimated_total > 0 else 30
-    debug_log(f' -> {key}: {estimated_total if estimated_total > 0 else "Unknown"} photo(s) [zoom={zoom}]')
-    dump_page_state(page, f'{key}_opened', note=f'zoom={zoom} total={estimated_total} loop_count={loop_count}')
+    loop_count = total if total > 0 else 30
+    debug_log(f' -> {key}: {total if total > 0 else "Unknown"} photo(s) [zoom={zoom}]')
+    dump_page_state(page, f'{key}_opened', note=f'zoom={zoom} total={total} loop_count={loop_count}')
 
     last_sig = None
     stuck_repeats = 0
     consecutive_misses = 0
-    section_new = 0
-    consecutive_section_duplicates = 0
 
     for i in range(1, loop_count + 1):
         before_sig = active_frame_signature(page)
@@ -597,18 +798,15 @@ def scrape_current_section(page, key, slug, global_idx, model_dir, http_session,
                     stuck_repeats = 0
                 debug_log(f' [sig] {key} idx={i} sig={sig} stuck_repeats={stuck_repeats}')
                 if clean_url in global_seen_urls:
-                    consecutive_section_duplicates += 1
                     try:
                         out.unlink(missing_ok=True)
                     except Exception:
                         pass
                     debug_log(f' SKIP {stem} (Global Duplicate URL)')
                 else:
-                    consecutive_section_duplicates = 0
                     global_seen_urls.add(clean_url)
                     debug_log(f' OK {out.name} [{w}x{h}]')
                     global_idx += 1
-                    section_new += 1
                 break
             else:
                 payload_hash = hashlib.md5(payload).hexdigest()
@@ -636,29 +834,16 @@ def scrape_current_section(page, key, slug, global_idx, model_dir, http_session,
                     stuck_repeats = 0
                 debug_log(f' [sig] {key} idx={i} sig={sig} stuck_repeats={stuck_repeats}')
                 if payload_hash in global_seen_hashes:
-                    consecutive_section_duplicates += 1
                     try:
                         out.unlink(missing_ok=True)
                     except Exception:
                         pass
                     debug_log(f' SKIP {stem} (Global Duplicate Base64)')
                 else:
-                    consecutive_section_duplicates = 0
                     global_seen_hashes.add(payload_hash)
                     debug_log(f' OK {out.name} [{w}x{h}]')
                     global_idx += 1
-                    section_new += 1
                 break
-
-        if section_new == 0 and consecutive_section_duplicates >= 3:
-            debug_log(' [!] Section yielded only global duplicates. Breaking early.')
-            dump_page_state(page, f'{key}_dupe_break_{i:03d}', note='section only duplicates')
-            break
-
-        if estimated_total > 0 and section_new >= estimated_total:
-            debug_log(f' [!] Expected total reached ({estimated_total}). Breaking early.')
-            dump_page_state(page, f'{key}_count_break_{i:03d}', note=f'estimated_total={estimated_total}')
-            break
 
         if stuck_repeats >= 3:
             debug_log(' [!] Same frame repeated after navigation. Breaking early.')
@@ -675,7 +860,8 @@ def scrape_current_section(page, key, slug, global_idx, model_dir, http_session,
     time.sleep(0.5)
     return global_idx
 
-def scrape_model(url, profile_dir, output_dir, headless, delay, debug):
+
+def scrape_model(url, profile_dir, output_dir, headless, delay, debug, media="photos"):
     global DEBUG, DEBUG_DIR, DEBUG_LOG_FH
     slug = extract_slug(url)
     model_dir = Path(output_dir) / slug
@@ -689,6 +875,7 @@ def scrape_model(url, profile_dir, output_dir, headless, delay, debug):
 
     debug_log(f'[*] Model  : {slug}')
     debug_log(f'[*] Output : {model_dir.resolve()}')
+    debug_log(f'[*] Media  : {media}')
 
     with sync_playwright() as pw:
         ctx = pw.chromium.launch_persistent_context(
@@ -701,8 +888,9 @@ def scrape_model(url, profile_dir, output_dir, headless, delay, debug):
         http_session = requests.Session()
         http_session.headers['User-Agent'] = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 
-        debug_log(f'[*] Navigating to {url} ...')
-        safe_goto(page, url)
+        start_url = model_video_url(url) if media == 'videos' else url
+        debug_log(f'[*] Navigating to {start_url} ...')
+        safe_goto(page, start_url)
         for c in ctx.cookies():
             http_session.cookies.set(c['name'], c['value'], domain=c.get('domain', ''), path=c.get('path', '/'))
 
@@ -718,6 +906,16 @@ def scrape_model(url, profile_dir, output_dir, headless, delay, debug):
 
         debug_log('[*] Waiting 3 s for gallery UI to render ...')
         time.sleep(3)
+
+        if media == 'videos':
+            saved = scrape_videos(page, model_dir, slug, http_session, delay, debug)
+            ctx.close()
+            if DEBUG_LOG_FH:
+                DEBUG_LOG_FH.close()
+                DEBUG_LOG_FH = None
+            print('')
+            print(f'[OK] Done -- {saved} video file(s) saved to {(model_dir / "videos").resolve()}')
+            return
 
         tabs = find_parte_tabs(page)
         if tabs:
@@ -800,6 +998,7 @@ if __name__ == '__main__':
     ap.add_argument('--headless', action='store_true')
     ap.add_argument('--delay', type=float, default=1.5)
     ap.add_argument('--debug', action='store_true')
+    ap.add_argument('--media', choices=['photos', 'videos'], default='photos')
     args = ap.parse_args()
 
     if args.setup:
@@ -807,4 +1006,4 @@ if __name__ == '__main__':
     elif not args.url:
         ap.error('--url is required unless using --setup')
     else:
-        scrape_model(args.url, args.profile, args.output, args.headless, args.delay, args.debug)
+        scrape_model(args.url, args.profile, args.output, args.headless, args.delay, args.debug, args.media)
