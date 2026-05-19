@@ -2,6 +2,7 @@
 import argparse
 import base64
 import hashlib
+import json
 import re
 import sys
 import time
@@ -137,6 +138,163 @@ def active_frame_signature(page):
 
 SEL_VIDEO_DOWNLOAD_BTN = "#btn-download-video button, #btn-download-video, button:has-text('Download')"
 
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def select_highest_video_resolution(page):
+    labels = ['4K', 'Ultra HD 4K', '2160p', 'Full HD 1080p', '1080p', 'HD 720p', '720p']
+    for label in labels:
+        try:
+            loc = page.get_by_text(label, exact=True)
+            if loc.count() > 0:
+                loc.last.scroll_into_view_if_needed(timeout=3000)
+                loc.last.click(timeout=5000, force=True)
+                time.sleep(3.0)
+                return label
+        except Exception:
+            pass
+    return 'default'
+
+
+def video_part_signature(page):
+    js = r"""
+() => {
+  const video = document.querySelector('video');
+  const poster = video ? (video.getAttribute('poster') || '') : '';
+  const currentSrc = video ? (video.currentSrc || video.src || '') : '';
+  const labelNodes = Array.from(document.querySelectorAll('.title-part, .text1, [class*="part"]'))
+    .map(el => (el.textContent || '').replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .slice(0, 30);
+  const thumbs = Array.from(document.querySelectorAll('.box-live img, img')).map(img => ({
+    src: img.currentSrc || img.src || '',
+    alt: img.alt || '',
+    cls: img.className || '',
+    w: img.naturalWidth || 0,
+    h: img.naturalHeight || 0
+  })).slice(0, 30);
+  const pageText = (document.body ? document.body.innerText : '').replace(/\s+/g, ' ').trim().slice(0, 1200);
+  return {poster, currentSrc, labelNodes, thumbs, pageText, url: location.href};
+}
+"""
+    try:
+        data = page.evaluate(js) or {}
+    except Exception:
+        data = {}
+    raw = json.dumps(data, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest(), data
+
+
+def wait_for_video_part_change(page, before_sig, timeout=30.0, debug=False, debug_prefix=None):
+    end = time.time() + timeout
+    stable_new = None
+    stable_hits = 0
+    while time.time() < end:
+        time.sleep(1.0)
+        sig, data = video_part_signature(page)
+        if sig != before_sig:
+            if stable_new == sig:
+                stable_hits += 1
+            else:
+                stable_new = sig
+                stable_hits = 1
+            if stable_hits >= 2:
+                if debug and debug_prefix:
+                    try:
+                        page.screenshot(path=f'{debug_prefix}.jpeg', full_page=True)
+                        with open(f'{debug_prefix}.txt', 'w', encoding='utf-8') as f:
+                            f.write(json.dumps(data, ensure_ascii=False, indent=2))
+                    except Exception:
+                        pass
+                return sig, data
+    return None, None
+
+
+def collect_part_targets(page, label):
+    targets = []
+    seen = set()
+    selectors = [
+        f'text="{label}"',
+        f'.title-part:has-text("{label}")',
+        f'.text1:has-text("{label}")',
+        '.box-live',
+        '.box-live img',
+        'img',
+    ]
+    for sel in selectors:
+        try:
+            locs = page.locator(sel)
+            count = min(locs.count(), 16)
+            for i in range(count):
+                try:
+                    loc = locs.nth(i)
+                    txt = (loc.text_content() or '').strip()
+                except Exception:
+                    txt = ''
+                key = f'{sel}::{i}::{txt[:80]}'
+                if key not in seen:
+                    seen.add(key)
+                    targets.append((sel, i))
+        except Exception:
+            pass
+    return targets
+
+
+def activate_video_part(page, label, debug=False, artifact_base=None):
+    before_sig, before_data = video_part_signature(page)
+    targets = collect_part_targets(page, label)
+    for n, (sel, idx) in enumerate(targets, start=1):
+        try:
+            loc = page.locator(sel).nth(idx)
+            if loc.count() == 0:
+                continue
+            loc.scroll_into_view_if_needed(timeout=3000)
+            loc.click(timeout=5000, force=True)
+            sig, data = wait_for_video_part_change(page, before_sig, timeout=30.0, debug=debug, debug_prefix=(f'{artifact_base}_activate_{n}' if artifact_base else None))
+            if sig:
+                return True, sig, data, (sel, idx)
+        except Exception:
+            pass
+    return False, before_sig, before_data, None
+
+
+def part_specificity_score(url: str, idx: int) -> int:
+    u = (url or '').lower()
+    p = idx + 1
+    score = 0
+    if f'4k{p}.mp4,.urlset/master.m3u8' in u:
+        score += 200
+    if f'4k{p}.mp4' in u:
+        score += 180
+    if f'fullhd{p}.mp4,.urlset/master.m3u8' in u:
+        score += 130
+    if f'fullhd{p}.mp4' in u:
+        score += 120
+    if f'hd{p}.mp4,.urlset/master.m3u8' in u:
+        score += 100
+    if f'hd{p}.mp4' in u:
+        score += 90
+    if f'4k.mp4,.urlset/master.m3u8' in u:
+        score += 80
+    if f'4k.mp4' in u:
+        score += 70
+    if f'fullhd.mp4,.urlset/master.m3u8' in u:
+        score += 40
+    if f'fullhd.mp4' in u:
+        score += 30
+    if f'parte-{p}' in u or f'part{p}' in u:
+        score += 20
+    return score
 
 def model_video_url(url: str) -> str:
     parsed = urlparse(url)
@@ -323,9 +481,17 @@ def scrape_videos(page, model_dir: Path, slug: str, http_session: requests.Sessi
     parts = list_video_parts(page)
     debug_log(f'[*] Video Parte tabs found: {len(parts)} -> {parts}')
     saved = 0
+    saved_hashes = set()
+
+    for existing in sorted(video_dir.glob('*.mp4')):
+        try:
+            saved_hashes.add(sha256_file(existing))
+        except Exception:
+            pass
 
     for idx, label in enumerate(parts):
         safe_part = re.sub(r'\s+', '_', label.strip())
+        artifact_base = str(DEBUG_DIR / f'_debug_video_{safe_part.lower()}') if debug and DEBUG_DIR else None
         network_log = []
         def on_response(resp):
             try:
@@ -336,32 +502,76 @@ def scrape_videos(page, model_dir: Path, slug: str, http_session: requests.Sessi
         try:
             if idx == 0:
                 debug_log(f'[*] Processing landing video {safe_part}')
+                current_sig, current_data = video_part_signature(page)
+                activated_by = ('landing', 0)
             else:
-                click_part_label(page, label)
-            debug_log(f'[*] Processing video {safe_part} [resolution=default]')
-            time.sleep(max(5.0, delay))
+                ok, current_sig, current_data, activated_by = activate_video_part(page, label, debug=debug, artifact_base=artifact_base)
+                if not ok:
+                    debug_log(f' [warn] could not activate a distinct page state for {safe_part}; continuing with best available state')
+            chosen_res = select_highest_video_resolution(page)
+            debug_log(f'[*] Selected resolution for {safe_part}: {chosen_res}')
+            if debug and artifact_base:
+                try:
+                    page.screenshot(path=f'{artifact_base}_state.jpeg', full_page=True)
+                    with open(f'{artifact_base}_state.txt', 'w', encoding='utf-8') as f:
+                        f.write(json.dumps({'activated_by': activated_by, 'signature': current_sig, 'resolution': chosen_res, 'state': current_data}, ensure_ascii=False, indent=2))
+                except Exception:
+                    pass
 
-            candidates = collect_media_candidates(page, network_log)
-            best = choose_best_video_candidate(candidates, idx)
-            debug_log(f'[*] Video candidates for {safe_part}: {len(candidates)} -> {candidates[:8]}')
-            if not best:
-                dl = click_download_and_capture(page, wait_s=10.0)
-                if dl is not None:
-                    suggested = dl.suggested_filename or f'{slug} - {safe_part.lower()}.mp4'
-                    ext = Path(suggested).suffix or '.mp4'
-                    dest = video_dir / f'{slug} - {safe_part.lower()}{ext}'
-                    try:
-                        dl.save_as(str(dest))
-                        debug_log(f' OK {dest.name} [browser download]')
+            attempts = 0
+            downloaded = False
+            tried_signatures = set()
+            while attempts < 8 and not downloaded:
+                attempts += 1
+                current_sig, current_data = video_part_signature(page)
+                tried_signatures.add(current_sig)
+                chosen_res = select_highest_video_resolution(page)
+                debug_log(f'[*] Processing video {safe_part} [attempt={attempts}, resolution={chosen_res}]')
+                time.sleep(max(8.0, delay))
+                candidates = collect_media_candidates(page, network_log)
+                candidates_sorted = sorted(candidates, key=lambda u: part_specificity_score(u, idx), reverse=True)
+                debug_log(f'[*] Video candidates for {safe_part}: {len(candidates_sorted)} -> {candidates_sorted[:8]}')
+                best = candidates_sorted[0] if candidates_sorted else None
+
+                if best:
+                    out = download_stream_or_file(best, http_session, video_dir / f'{slug} - {safe_part.lower()}')
+                    file_hash = sha256_file(out)
+                    if file_hash in saved_hashes:
+                        try:
+                            out.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        debug_log(f' [warn] downloaded duplicate bytes for {safe_part}; traversing DOM for a new state')
+                    else:
+                        saved_hashes.add(file_hash)
+                        debug_log(f' OK {out.name}')
                         saved += 1
-                        continue
-                    except Exception as e:
-                        debug_log(f' [warn] browser download save failed for {safe_part}: {e}')
-                debug_log(f' [warn] no downloadable video found in {safe_part}')
-                continue
-            out = download_stream_or_file(best, http_session, video_dir / f'{slug} - {safe_part.lower()}')
-            debug_log(f' OK {out.name}')
-            saved += 1
+                        downloaded = True
+                        break
+
+                next_found = False
+                for sel, j in collect_part_targets(page, label):
+                    try:
+                        loc = page.locator(sel).nth(j)
+                        if loc.count() == 0:
+                            continue
+                        before_sig, _ = video_part_signature(page)
+                        loc.scroll_into_view_if_needed(timeout=3000)
+                        loc.click(timeout=5000, force=True)
+                        new_sig, _ = wait_for_video_part_change(page, before_sig, timeout=20.0, debug=debug, debug_prefix=(f'{artifact_base}_domwalk_{attempts}_{j}' if artifact_base else None))
+                        if new_sig and new_sig not in tried_signatures:
+                            chosen_res = select_highest_video_resolution(page)
+                            debug_log(f'[*] DOM traversal found a new state for {safe_part} via {sel}[{j}] with resolution {chosen_res}')
+                            next_found = True
+                            break
+                    except Exception:
+                        pass
+                if not next_found:
+                    debug_log(f' [warn] no new DOM state found for {safe_part} after duplicate/weak candidate')
+                    break
+
+            if not downloaded:
+                debug_log(f' [warn] unable to reach a unique downloadable video for {safe_part}')
         except Exception as e:
             debug_log(f' [warn] {safe_part}: {e}')
         finally:
