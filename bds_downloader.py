@@ -152,19 +152,62 @@ def sha256_file(path: Path) -> str:
 
 
 def select_highest_video_resolution(page):
-    labels = ['4K', 'Ultra HD 4K', '2160p', 'Full HD 1080p', '1080p', 'HD 720p', '720p']
-    for label in labels:
+    option_groups = [
+        ('4K', [r'text=/^\s*4k\s*$/i', r'text=/ultra\s*hd\s*4k/i', r'text=/2160p/i']),
+        ('Full HD 1080p', [r'text=/full\s*hd\s*1080p/i', r'text=/1080p/i']),
+        ('HD 720p', [r'text=/hd\s*720p/i', r'text=/720p/i']),
+    ]
+    openers = [
+        r'text=/4k|2160p|1080p|720p|full\s*hd|ultra\s*hd/i',
+        '[class*="resolution" i]',
+        '[class*="quality" i]',
+        '.text1',
+        '.title-part',
+        'button',
+        'a',
+        'span',
+        'div',
+    ]
+
+    def click_option(patterns):
+        for pat in patterns:
+            try:
+                loc = page.locator(f'{pat} >> visible=true').last
+                if loc.count() == 0:
+                    continue
+                loc.scroll_into_view_if_needed(timeout=3000)
+                loc.click(timeout=5000, force=True)
+                time.sleep(2.5)
+                return True
+            except Exception:
+                pass
+        return False
+
+    for label, patterns in option_groups:
+        if click_option(patterns):
+            return label
+
+    for opener in openers:
         try:
-            loc = page.get_by_text(label, exact=True)
-            if loc.count() > 0:
-                loc.last.scroll_into_view_if_needed(timeout=3000)
-                loc.last.click(timeout=5000, force=True)
-                time.sleep(3.0)
-                return label
+            locs = page.locator(f'{opener} >> visible=true')
+            count = min(locs.count(), 12)
+            for i in range(count):
+                try:
+                    loc = locs.nth(i)
+                    txt = (loc.text_content() or '').strip()
+                    if not re.search(r'4k|2160p|1080p|720p|full\s*hd|ultra\s*hd|hd\s*720p', txt, re.I):
+                        continue
+                    loc.scroll_into_view_if_needed(timeout=3000)
+                    loc.click(timeout=5000, force=True)
+                    time.sleep(1.5)
+                    for label, patterns in option_groups:
+                        if click_option(patterns):
+                            return label
+                except Exception:
+                    pass
         except Exception:
             pass
     return 'default'
-
 
 def video_part_signature(page):
     js = r"""
@@ -273,27 +316,35 @@ def part_specificity_score(url: str, idx: int) -> int:
     p = idx + 1
     score = 0
     if f'4k{p}.mp4,.urlset/master.m3u8' in u:
-        score += 200
+        score += 100000
     if f'4k{p}.mp4' in u:
-        score += 180
+        score += 90000
     if f'fullhd{p}.mp4,.urlset/master.m3u8' in u:
-        score += 130
+        score += 60000
     if f'fullhd{p}.mp4' in u:
-        score += 120
+        score += 50000
     if f'hd{p}.mp4,.urlset/master.m3u8' in u:
-        score += 100
+        score += 30000
     if f'hd{p}.mp4' in u:
-        score += 90
-    if f'4k.mp4,.urlset/master.m3u8' in u:
-        score += 80
-    if f'4k.mp4' in u:
-        score += 70
-    if f'fullhd.mp4,.urlset/master.m3u8' in u:
-        score += 40
-    if f'fullhd.mp4' in u:
-        score += 30
-    if f'parte-{p}' in u or f'part{p}' in u:
-        score += 20
+        score += 20000
+    if p == 1 and '4k.mp4,.urlset/master.m3u8' in u:
+        score += 15000
+    if p == 1 and '4k.mp4' in u:
+        score += 12000
+    if p == 1 and 'fullhd.mp4,.urlset/master.m3u8' in u:
+        score += 9000
+    if p == 1 and 'fullhd.mp4' in u:
+        score += 7000
+    if '.m3u8' in u:
+        score += 2500
+    if '.mp4' in u:
+        score += 1000
+    if '4k' in u or '2160' in u:
+        score += 500
+    elif 'fullhd' in u or '1080' in u:
+        score += 250
+    elif 'hd' in u or '720' in u:
+        score += 100
     return score
 
 def model_video_url(url: str) -> str:
@@ -405,31 +456,66 @@ def collect_media_candidates(page, network_log):
 
 
 def choose_best_video_candidate(candidates, part_idx):
-    if not candidates:
-        return None
-    idx1 = part_idx + 1
-    def score(url):
-        u = url.lower()
-        s = 0
-        if f'4k{idx1}.mp4,.urlset/master.m3u8' in u:
-            s += 50000
-        if f'4k{idx1}' in u:
-            s += 30000
-        if f'4k-{idx1}' in u:
-            s += 28000
-        if f'/4k{idx1}.' in u:
-            s += 26000
-        if '.m3u8' in u:
-            s += 12000
-        if '.mp4' in u:
-            s += 5000
-        if '4k' in u or '2160' in u:
-            s += 2000
-        elif '1080' in u:
-            s += 1000
-        return s
-    return sorted(candidates, key=score, reverse=True)[0]
+    ordered = sorted(build_video_candidate_variants(candidates, part_idx), key=lambda u: part_specificity_score(u, part_idx), reverse=True)
+    return ordered[0] if ordered else None
 
+
+def build_video_candidate_variants(candidates, part_idx):
+    idx1 = part_idx + 1
+    out = []
+
+    def add(url):
+        if url and url not in out:
+            out.append(url)
+
+    for raw in unique_preserve(candidates):
+        u = (raw or '').strip()
+        if not u:
+            continue
+        add(u)
+        low = u.lower()
+        if ',.urlset/master.m3u8' in low:
+            add(u.replace(',.urlset/master.m3u8', ''))
+        elif low.endswith('.mp4'):
+            add(u + ',.urlset/master.m3u8')
+
+        m = re.search(r'(4k|fullhd|hd)(\d*)\.mp4', u, re.I)
+        if not m:
+            continue
+
+        if idx1 == 1:
+            replacements = ['4k.mp4', '4k1.mp4', 'fullhd.mp4', 'fullhd1.mp4', 'hd.mp4', 'hd1.mp4']
+        else:
+            replacements = [f'4k{idx1}.mp4', f'fullhd{idx1}.mp4', f'hd{idx1}.mp4']
+
+        for repl in replacements:
+            variant = re.sub(r'(4k|fullhd|hd)(\d*)\.mp4', repl, u, count=1, flags=re.I)
+            add(variant)
+            vlow = variant.lower()
+            if ',.urlset/master.m3u8' in vlow:
+                add(variant.replace(',.urlset/master.m3u8', ''))
+            elif vlow.endswith('.mp4'):
+                add(variant + ',.urlset/master.m3u8')
+
+    return out
+
+
+def download_best_video_candidate(candidates, session, dest_base: Path, part_idx: int):
+    ordered = sorted(build_video_candidate_variants(candidates, part_idx), key=lambda u: part_specificity_score(u, part_idx), reverse=True)
+    last_exc = None
+    for candidate in ordered:
+        try:
+            out = download_stream_or_file(candidate, session, dest_base)
+            return out, candidate, ordered
+        except Exception as e:
+            last_exc = e
+            try:
+                dest_base.with_suffix('.mp4').unlink(missing_ok=True)
+            except Exception:
+                pass
+    if last_exc:
+        raise last_exc
+    raise ValueError('no downloadable video candidate')
 
 def download_stream_or_file(url: str, session: requests.Session, dest_base: Path):
     out = dest_base.with_suffix('.mp4')
@@ -491,7 +577,7 @@ def scrape_videos(page, model_dir: Path, slug: str, http_session: requests.Sessi
 
     for idx, label in enumerate(parts):
         safe_part = re.sub(r'\s+', '_', label.strip())
-        artifact_base = str(DEBUG_DIR / f'_debug_video_{safe_part.lower()}') if debug and DEBUG_DIR else None
+        artifact_base = f'_debug_video_{safe_part.lower()}' if debug else None
         network_log = []
         def on_response(resp):
             try:
@@ -529,12 +615,13 @@ def scrape_videos(page, model_dir: Path, slug: str, http_session: requests.Sessi
                 debug_log(f'[*] Processing video {safe_part} [attempt={attempts}, resolution={chosen_res}]')
                 time.sleep(max(8.0, delay))
                 candidates = collect_media_candidates(page, network_log)
-                candidates_sorted = sorted(candidates, key=lambda u: part_specificity_score(u, idx), reverse=True)
+                candidates_sorted = sorted(build_video_candidate_variants(candidates, idx), key=lambda u: part_specificity_score(u, idx), reverse=True)
                 debug_log(f'[*] Video candidates for {safe_part}: {len(candidates_sorted)} -> {candidates_sorted[:8]}')
                 best = candidates_sorted[0] if candidates_sorted else None
 
                 if best:
-                    out = download_stream_or_file(best, http_session, video_dir / f'{slug} - {safe_part.lower()}')
+                    out, used_candidate, _ordered = download_best_video_candidate(candidates, http_session, video_dir / f'{slug} - {safe_part.lower()}', idx)
+                    debug_log(f'[*] Download URL for {safe_part}: {used_candidate}')
                     file_hash = sha256_file(out)
                     if file_hash in saved_hashes:
                         try:
